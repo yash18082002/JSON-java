@@ -283,5 +283,8 @@ public class JSONPointer {
             throw new RuntimeException(e);
         }
     }
+    public static String unescapeToken(String token) {
+        return unescape(token);
+    }
     
 }

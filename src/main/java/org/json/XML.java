@@ -9,6 +9,7 @@ import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.Iterator;
+import java .io.*;
 
 /**
  * This provides static methods to convert an XML text into a JSONObject, and to
@@ -680,6 +681,302 @@ public class XML {
      */
     public static JSONObject toJSONObject(Reader reader) throws JSONException {
         return toJSONObject(reader, XMLParserConfiguration.ORIGINAL);
+    }
+
+    public static JSONObject toJSONObject(Reader reader, JSONPointer path) throws JSONException {
+        String pathString = path.toString();
+        if (pathString.endsWith("/")) {
+            pathString = pathString.substring(0, pathString.length() - 1);
+            path = new JSONPointer(pathString);
+        }
+        String[] pathSegments = getPathSegments(path.toString());
+
+        if (pathSegments.length == 0) {
+            return toJSONObject(reader);
+        }
+
+        CountingReader countingReader = new CountingReader(reader);
+        long last = 0;
+        JSONObject temp = new JSONObject();
+        JSONObject result = null;
+        boolean found = false;
+        XMLParserConfiguration config = XMLParserConfiguration.ORIGINAL;
+        XMLTokener token = new XMLTokener(countingReader, config);
+
+        while (token.more() && !found) {
+            token.skipPast("<");
+            if (!token.more()) {
+                break;
+            }
+            parse(token, temp, null, config, 0);
+            try {
+                Object pathResult = path.queryFrom(temp);
+                if (pathResult != null) {
+                    found = true;
+                    if (pathResult instanceof JSONObject) {
+                        result = (JSONObject) pathResult;
+                    } else {
+                        result = new JSONObject();
+                        String lastSegment = pathSegments[pathSegments.length - 1];
+                        result.put(lastSegment, pathResult);
+                    }
+                    break;
+                }
+            } catch (JSONPointerException e) {
+                // Path not found
+            }
+            long current = countingReader.getPosition();
+            if (current == last) {
+                break;
+            }
+            last = current;
+        }
+        if (found && result != null) {
+            return result;
+        }
+        throw new JSONException("Path not found : " + path);
+    }
+
+    // took help of chatgpt for this code
+    private static class CountingReader extends Reader {
+        private final Reader wrapped;
+        private long position = 0;
+
+        public CountingReader(Reader reader) {
+            this.wrapped = reader;
+        }
+
+        public long getPosition() {
+            return position;
+        }
+
+        @Override
+        public int read(char[] chars, int off, int len) throws IOException {
+            int result = wrapped.read(chars, off, len);
+            if (result > 0) {
+                position += result;
+            }
+            return result;
+        }
+            
+        @Override
+        public void close() throws IOException {
+            wrapped.close();
+        }
+    }
+
+    private static String[] getPathSegments(String path) {
+        if (path == null || path.isEmpty()) {
+            return new String[0];
+        }
+        if (path.startsWith("/")) {
+            path = path.substring(1);
+        }
+        if (path.endsWith("/")) {
+            path = path.substring(0, path.length() - 1);
+        }
+        if (path.isEmpty()) {
+            return new String[0];
+        }
+        String[] parts = path.split("/");
+        for (int i = 0; i < parts.length; i++) {
+            parts[i] = JSONPointer.unescapeToken(parts[i]);
+        }
+        return parts;
+    }
+
+    public static JSONObject toJSONObject(Reader reader, JSONPointer path, JSONObject replacement) throws JSONException {
+        if (path.toString().isEmpty() || path.toString().equals("/")) {
+            XMLTokener token = new XMLTokener(reader, XMLParserConfiguration.ORIGINAL);
+            if (!token.more()) {
+                throw new JSONException("Empty XML document");
+            }
+            return replacement;
+        }
+        String pathString = path.toString();
+        boolean trailingSlash = pathString.endsWith("/");
+        if (trailingSlash) {
+            pathString = pathString.substring(0, pathString.length() - 1);
+            path = new JSONPointer(pathString);
+        }
+        String[] pathSegments = getPathSegments(path.toString());
+        if (pathSegments.length <= 2) {
+            return shallowPathReplacement(reader, pathSegments, replacement, trailingSlash);
+        }
+        JSONObject result = new JSONObject();
+        CountingReader cr = new CountingReader(reader);
+        long last = 0;
+        XMLParserConfiguration config = XMLParserConfiguration.ORIGINAL;
+        XMLTokener token = new XMLTokener(cr, config);
+        
+        while (token.more()) {
+            token.skipPast("<");
+            if (!token.more()) {
+                break;
+            }
+            parse(token, result, null, config, 0);
+            try {
+                JSONPointer parentPath = pathToParent(path);
+                Object parent = parentPath.queryFrom(result);
+                
+                if (parent instanceof JSONObject) {
+                    String lastSegment = pathSegments[pathSegments.length - 1];
+                    Object originalValue = ((JSONObject) parent).opt(lastSegment);
+                    if (trailingSlash && originalValue != null) {
+                        if (replacement.length() == 1) {
+                            String firstKey = replacement.keys().next();
+                            ((JSONObject) parent).put(lastSegment, replacement.get(firstKey));
+                        } else {
+                            ((JSONObject) parent).put(lastSegment, replacement);
+                        }
+                    } else {
+                        ((JSONObject) parent).put(lastSegment, replacement);
+                    }
+                    break;
+                }
+            } catch (JSONPointerException e) {
+                // Path not found
+            }
+            long current = cr.getPosition();
+            if (current == last) {
+                break;
+            }
+            last = current;
+        }
+        try {
+            path.queryFrom(result);
+            return result;
+        } catch (JSONPointerException e) {
+            throw new JSONException("Path not found : " + path);
+        }
+    }
+
+    // took help of chatgpt
+    private static JSONObject shallowPathReplacement(Reader reader, String[] pathSegments, JSONObject replacement, boolean trailingSlash) throws JSONException {
+        JSONObject result = new JSONObject();
+        XMLParserConfiguration config = XMLParserConfiguration.ORIGINAL;
+        XMLTokener tokener = new XMLTokener(reader, config);
+        if (pathSegments.length == 1) {
+            String targetKey = pathSegments[0];
+            
+            while (tokener.more()) {
+                tokener.skipPast("<");
+                if (!tokener.more()) {
+                    break;
+                }
+                
+                Object token = tokener.nextToken();
+                if (token instanceof String) {
+                    String tagName = (String) token;
+                    
+                    if (tagName.equals(targetKey)) {
+                        int depth = 1;
+                        while (depth > 0 && tokener.more()) {
+                            token = tokener.nextToken();
+                            if (token == LT) {
+                                if (tokener.nextToken() == SLASH) {
+                                    depth--;
+                                } else {
+                                    depth++;
+                                }
+                            }
+                        }
+                        if (trailingSlash && replacement.length() == 1) {
+                            String firstKey = replacement.keys().next();
+                            result.put(targetKey, replacement.get(firstKey));
+                        } else {
+                            result.put(targetKey, replacement);
+                        }
+                    } else {
+                        tokener.back();
+                        parse(tokener, result, null, config, 0);
+                    }
+                }
+            }
+        }
+        else if (pathSegments.length == 2) {
+            String parent = pathSegments[0];
+            String target = pathSegments[1];
+            
+            while (tokener.more()) {
+                tokener.skipPast("<");
+                if (!tokener.more()) {
+                    break;
+                }
+                
+                Object token = tokener.nextToken();
+                if (token instanceof String) {
+                    String tagName = (String) token;
+                    
+                    if (tagName.equals(parent)) {
+                        JSONObject parentObj = new JSONObject();
+                        boolean found = false;
+                        while (tokener.more() && token != GT) {
+                            token = tokener.nextToken();
+                        }
+                        while (tokener.more()) {
+                            token = tokener.nextContent();
+                            if (token == LT) {
+                                token = tokener.nextToken();
+                                
+                                if (token == SLASH) {
+                                    token = tokener.nextToken();
+                                    if (token.equals(parent)) {
+                                        break;
+                                    }
+                                } else if (token instanceof String) {
+                                    String childTagName = (String) token;
+                                    
+                                    if (childTagName.equals(target)) {
+                                        found = true;
+                                        
+                                        if (trailingSlash && replacement.length() == 1) {
+                                            String firstKey = replacement.keys().next();
+                                            parentObj.put(target, replacement.get(firstKey));
+                                        } else {
+                                            parentObj.put(target, replacement);
+                                        }
+                                        int depth = 1;
+                                        while (depth > 0 && tokener.more()) {
+                                            token = tokener.nextToken();
+                                            if (token == LT) {
+                                                token = tokener.nextToken();
+                                                if (token == SLASH) {
+                                                    depth--;
+                                                } else {
+                                                    depth++;
+                                                    tokener.back();
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        tokener.back();
+                                        parse(tokener, parentObj, null, config, 0);
+                                    }
+                                }
+                            }
+                        }
+                        result.put(parent, parentObj);
+                    } else {
+                        tokener.back();
+                        parse(tokener, result, null, config, 0);
+                    }
+                }
+            }
+        }
+        
+        return result;
+    }
+
+    private static JSONPointer pathToParent(JSONPointer pointer) {
+        String pathStr = pointer.toString();
+        int lastSlash = pathStr.lastIndexOf('/');
+        
+        if (lastSlash <= 0) {
+            return new JSONPointer("");
+
+        }
+        return new JSONPointer(pathStr.substring(0, lastSlash));
     }
 
     /**
